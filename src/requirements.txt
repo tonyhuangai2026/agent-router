@@ -1,0 +1,28 @@
+# Python dependencies for the Qwen3-1.7B LoRA SFT SageMaker training job (T3).
+#
+# These are installed by SageMaker into the HuggingFace PyTorch DLC at job
+# startup (the launcher packages this file via `source_dir`, Tech Design §4.1).
+# The DLC already ships a CUDA-matched PyTorch build, so torch is intentionally
+# NOT pinned here -- pinning torch would risk fighting the DLC's CUDA wheels.
+# Everything below is the LoRA-SFT stack layered on top of that base image.
+#
+# Versions are pinned to a mutually-compatible set that works with the current
+# HF PyTorch training DLC (transformers 4.51 / PyTorch 2.6 family). They are
+# pinned with `>=,<` ceilings so a patch release can still be picked up while a
+# known-incompatible major/minor cannot silently break the job.
+#
+# transformers MUST be >=4.51: the Qwen3 architecture only landed in transformers
+# 4.51, and the DLC image (huggingface-pytorch-training:2.6-transformers4.51-...)
+# already ships 4.51 -- these pins must NOT downgrade below it. peft/trl/
+# accelerate/datasets ceilings are loosened to a set mutually compatible with
+# transformers 4.51.
+
+transformers>=4.51,<4.53
+peft>=0.15.0,<0.18.0
+trl>=0.16.0,<0.20.0
+accelerate>=1.6.0,<2.0.0
+datasets>=3.5.0,<4.0.0
+
+# Adapter serialization (safe tensors) -- usually already present in the DLC,
+# pinned defensively so `save_pretrained(safe_serialization=True)` always works.
+safetensors>=0.4.3

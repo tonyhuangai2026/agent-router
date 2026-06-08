@@ -1,0 +1,19 @@
+# Python dependencies for the LOCAL launcher (launch_sagemaker.py), Tech Design §4.2.
+#
+# These are NOT installed in the SageMaker training job (that job uses
+# src/requirements.txt). They are what you need on the *launching* machine.
+#
+# IMPORTANT (per task note): the `sagemaker` SDK is required only for a REAL
+# `estimator.fit()` submission. `launch_sagemaker.py --dry-run` imports sagemaker
+# LAZILY and therefore runs WITHOUT this SDK — it only needs PyYAML (and, for the
+# credential/role/bucket auto-detect, boto3 / the AWS CLI, both optional).
+#
+# Install everything for a real launch:
+#     pip install -r requirements-launch.txt
+#
+# Or, minimally, just to validate the plan offline:
+#     pip install pyyaml
+
+pyyaml>=6.0            # read config.yaml (required by --dry-run and real launch)
+boto3>=1.28            # AWS auto-detect (sts/iam/s3). Falls back to the AWS CLI if absent.
+sagemaker>=2.190,<3    # HuggingFace Estimator + fit(). REQUIRED only for a real launch.

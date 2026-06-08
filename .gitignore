@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Prepared data is regenerated from your own --input (do not commit mock/derived data)
+data/prepared/
+
+# Evaluation / report outputs (regenerated per run)
+report/
+/tmp/
+
+# Model artifacts
+*.tar.gz
+*.safetensors
+
+# Secrets / keys — NEVER commit these
+*.pem
+*_deploy_key
+*_deploy_key.pub
+id_rsa*
+id_ed25519*
+.env
+*.key
+
+# OS / editor
+.DS_Store
+*.swp

@@ -1,0 +1,184 @@
+# =============================================================================
+# config.yaml — single source of truth for the Qwen3-1.7B classifier SageMaker
+# training launch (Tech Design §4). EVERY knob the launcher needs lives here so
+# launch_sagemaker.py contains no hard-coded magic numbers; override any value
+# here (or via the documented env vars) without touching code.
+#
+# Consumed by: launch_sagemaker.py
+# The hyperparameters block is passed verbatim to the HuggingFace Estimator and
+# arrives in src/train.py as `--key value` argv (see train.py:parse_args).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# AWS / SageMaker placement (detected environment, Tech Design §4.1)
+# -----------------------------------------------------------------------------
+aws:
+  region: us-east-1                  # training region.
+  account: "<YOUR_AWS_ACCOUNT_ID>"   # <-- SET THIS to your 12-digit AWS account id.
+  # Execution role the training job assumes. Resolution order at launch time:
+  #   1. env SAGEMAKER_ROLE  (highest priority — lets ops override per run)
+  #   2. this config value (execution_role) if set non-empty
+  #   3. auto-discovery of an AmazonSageMaker-ExecutionRole-* via IAM list-roles
+  # Easiest: leave execution_role empty and `export SAGEMAKER_ROLE=arn:aws:iam::...`
+  # at launch, or fill in your role ARN below.
+  execution_role: ""                 # e.g. arn:aws:iam::<ACCOUNT_ID>:role/service-role/AmazonSageMaker-ExecutionRole-XXXX
+  # Substring used to auto-discover an execution role if the above is empty and
+  # SAGEMAKER_ROLE is unset.
+  execution_role_name_contains: "AmazonSageMaker-ExecutionRole"
+
+# -----------------------------------------------------------------------------
+# S3 layout (Tech Design §2.6 / §4.1)
+# -----------------------------------------------------------------------------
+s3:
+  # Leave bucket empty to use the SageMaker default bucket for the account/region
+  # (sagemaker-<region>-<account>). Set an explicit bucket to override. The
+  # launcher will create the default bucket if it is missing and the caller has
+  # s3:CreateBucket.
+  bucket: ""
+  # All job artifacts live under this prefix in the bucket.
+  prefix: "qwen-classifier"
+  # Sub-paths under <bucket>/<prefix>/ for the prepared data channels and output.
+  data_subpath: "data"        # -> s3://<bucket>/<prefix>/data/{train,validation,test}/
+  output_subpath: "output"    # -> s3://<bucket>/<prefix>/output/  (model.tar.gz lands here)
+
+# -----------------------------------------------------------------------------
+# Local prepared-data location (uploaded to S3 as the train/val/test channels)
+# Path is resolved relative to this config file's directory.
+# -----------------------------------------------------------------------------
+data:
+  prepared_dir: "data/prepared"
+  train_file: "train.jsonl"
+  validation_file: "val.jsonl"
+  test_file: "test.jsonl"
+
+# -----------------------------------------------------------------------------
+# Compute (Tech Design §4.1)
+# -----------------------------------------------------------------------------
+compute:
+  # KEEP ml.g5.2xlarge — it is the only GPU training instance with quota (=1) in
+  # this account/region. The g6e / g6 families currently have a TRAINING quota of
+  # 0, so a job on them is rejected with ResourceLimitExceeded until a quota
+  # increase is approved.
+  #
+  # === How to switch to ml.g6e.2xlarge (NVIDIA L40S 48GB — stronger than the ===
+  # === g5's A10G 24GB) once quota is granted: =================================
+  #   1. AWS Console -> Service Quotas -> AWS services -> "Amazon SageMaker".
+  #   2. Find the quota "ml.g6e.2xlarge for training job usage"
+  #      (CLI: aws service-quotas list-service-quotas --service-code sagemaker \
+  #              --region us-east-1 --query \
+  #              "Quotas[?contains(QuotaName,'g6e.2xlarge for training job usage')]").
+  #   3. Request increase -> set the value to >= 1 and submit.
+  #   4. After AWS approves (quota shows >= 1), change instance_type below to
+  #      "ml.g6e.2xlarge". Nothing else needs to change; max_len could be raised
+  #      back toward 4096 to exploit the 48GB. See README §6.x for the same steps.
+  instance_type: "ml.g5.2xlarge"   # single A10G 24GB — sufficient for 1.7B LoRA. (g6e/g6 = 0 quota; see note above.)
+  instance_count: 1
+  volume_size_gb: 100               # EBS for model download + checkpoints.
+  max_run_seconds: 3600             # 1h cap (job auto-stops if exceeded) — cost guard; default is 86400=24h.
+  # Optional managed spot training (cheaper, can be interrupted). Off by default.
+  use_spot_instances: false
+  max_wait_seconds: 90000           # only used when use_spot_instances: true.
+
+# -----------------------------------------------------------------------------
+# Training code packaging (Tech Design §4.1 — source_dir installs requirements)
+# Paths are relative to this config file's directory.
+# -----------------------------------------------------------------------------
+code:
+  source_dir: "src"            # packaged & uploaded; requirements.txt here is pip-installed in the job.
+  entry_point: "train.py"      # => entry_point="train.py", source_dir="src" (i.e. src/train.py).
+  base_job_name: "qwen-classifier-lora-sft"
+
+# -----------------------------------------------------------------------------
+# CloudWatch loss-curve monitoring (metric_definitions).
+# -----------------------------------------------------------------------------
+# SageMaker scrapes the training-job stdout/stderr line-by-line against these
+# regexes and publishes the LAST captured numeric group of each match as a
+# time-series metric into CloudWatch namespace "/aws/sagemaker/TrainingJobs"
+# (dimensions: TrainingJobName, Host=algo-1). This lets you watch the loss curve
+# live in the SageMaker console (Training job -> Metrics) or via the CloudWatch
+# console / get-metric-statistics — with NO wandb/tensorboard and no code in
+# train.py beyond its existing stdout logging.
+#
+# WHY THESE REGEXES: src/train.py runs the HF Trainer with logging_steps=5 and
+# report_to=[]; the Trainer's PrinterCallback prints each log as a Python dict to
+# stdout. The exact text differs by transformers version:
+#   * transformers 4.51 (the pinned DLC image used by the real job) prints the
+#     RAW dict with UNQUOTED floats:   {'loss': 0.1234, 'learning_rate': 0.0002, 'epoch': 0.93}
+#   * transformers 5.x formats floats as :.4g STRINGS (quoted):
+#                                       {'loss': '0.1234', 'learning_rate': '0.0002', 'epoch': '0.93'}
+# The optional quote  '?  after each colon makes every regex match BOTH styles.
+# The leading  '  before the key anchors it so 'loss' does not also fire on
+# 'eval_loss' / 'train_loss'. Each capture group is a valid float for SageMaker.
+# These are passed verbatim into the HuggingFace Estimator's metric_definitions
+# (launch_sagemaker.py) and shown in `--dry-run`.
+metrics:
+  metric_definitions:
+    - Name: "train:loss"
+      Regex: "'loss':\\s*'?([0-9\\.]+)"
+    - Name: "eval:loss"
+      Regex: "'eval_loss':\\s*'?([0-9\\.]+)"
+    - Name: "learning_rate"
+      Regex: "'learning_rate':\\s*'?([0-9\\.eE+-]+)"
+    - Name: "epoch"
+      Regex: "'epoch':\\s*'?([0-9\\.]+)"
+
+# -----------------------------------------------------------------------------
+# HuggingFace Deep Learning Container image selection (Tech Design §4.1)
+# The HuggingFace Estimator picks the official HF PyTorch TRAINING DLC from these
+# framework version tags. These are a known-good, widely-available combination
+# for the HF PyTorch training DLC in us-east-1. To pin a specific image instead,
+# set image_uri to a full ECR URI and it takes precedence over the version tags.
+# -----------------------------------------------------------------------------
+image:
+  # The version tags below are only a FALLBACK used when image_uri is empty (the
+  # HuggingFace Estimator resolves a DLC from them). Since image_uri is set
+  # non-empty below, it WINS and these tags are ignored — but the launcher's
+  # config validator (launch_sagemaker.py) requires them to be present/non-empty,
+  # so they are kept and aligned to the pinned image for clarity.
+  transformers_version: "4.51"
+  pytorch_version: "2.6"
+  py_version: "py312"
+  # Explicit full ECR URI of the HuggingFace PyTorch TRAINING DLC that ships
+  # transformers 4.51 (required for the Qwen3 architecture). Wins over the tags.
+  image_uri: "763104351884.dkr.ecr.us-east-1.amazonaws.com/huggingface-pytorch-training:2.6-transformers4.51-gpu-py312-cu126-ubuntu22.04"
+
+# -----------------------------------------------------------------------------
+# Hyperparameters — passed verbatim to the Estimator and forwarded to train.py
+# as CLI args. These mirror the Tech Design §3.3 defaults and train.py's own
+# argparse defaults; change them here to retune the SageMaker job.
+# -----------------------------------------------------------------------------
+hyperparameters:
+  model_id: "Qwen/Qwen3-1.7B"
+  # Lowered 4096 -> 2048 to bound peak activation memory on the A10G (24GB). The
+  # prepared data is long (mean ~9.8k chars, p90 ~16.8k); train.py tail-truncates
+  # while preserving the (short) completion/label, so the JSON label still
+  # survives the clip. Combined with per_device_batch=1 this fixed a step-0 CUDA
+  # OOM (first run tried to allocate 8.61GiB with only 3.42GiB free).
+  max_len: 2048
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lr: 0.0002
+  epochs: 3
+  # per_device_batch 4 -> 1 (primary OOM remedy, Tech Design §7): ~4x less
+  # activation memory. grad_accum raised 8 -> 32 to keep the effective batch
+  # size (1*32 == prior 4*8 == 32), so the optimization trajectory is unchanged.
+  per_device_batch: 1
+  grad_accum: 32
+  warmup_ratio: 0.03
+  seed: 42
+  bf16: true
+  gradient_checkpointing: true
+  # In-job evaluation (Tech Design q4 option C): after the artifact is saved,
+  # train.py runs a best-effort REAL model.generate() sweep over the test set on
+  # the SAME GPU and writes metrics.json + report.md into SM_MODEL_DIR/eval/ (so
+  # they ride out in model.tar.gz). This satisfies "inference on the SageMaker
+  # GPU, not local CPU" with no extra job/endpoint. Best-effort: a failure here
+  # only warns and never fails the (already successful) training job. Set false
+  # to skip. The launcher uploads the `test` channel, so SM_CHANNEL_TEST is set
+  # in the job and train.py auto-discovers the held-out test.jsonl.
+  run_eval_in_job: true
+  eval_max_new_tokens: 16
+  # train.py also reads SM_CHANNEL_TRAIN / SM_CHANNEL_VALIDATION / SM_CHANNEL_TEST
+  # for the data dirs and SM_MODEL_DIR for output, so no path hyperparameters are
+  # needed here.
