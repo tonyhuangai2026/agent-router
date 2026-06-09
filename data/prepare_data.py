@@ -40,6 +40,7 @@ import json
 import os
 import statistics
 import sys
+import time
 from collections import Counter, OrderedDict, defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -445,6 +446,156 @@ def build_stats(
 # Driver
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Parallel explode (multiprocessing)
+# ---------------------------------------------------------------------------
+
+# Per-worker state. Each worker process loads the tokenizer ONCE on init (HF
+# tokenizer objects don't pickle cleanly across processes) and reuses it for
+# every conversation it processes. The render_cache is per-conversation —
+# verified on demo_data.jsonl that conversation-level sharding loses <1% of
+# global cache hits, so the speed cost is negligible.
+_WORKER_TOKENIZER = None  # type: ignore[assignment]
+_WORKER_OPTS: Dict[str, Any] = {}
+
+
+def _worker_init(force_fallback: bool, opts: Dict[str, Any]) -> None:
+    global _WORKER_TOKENIZER, _WORKER_OPTS
+    if force_fallback:
+        _WORKER_TOKENIZER = labeling.SimpleWhitespaceTokenizer()
+    else:
+        _WORKER_TOKENIZER = labeling.get_tokenizer()
+    _WORKER_OPTS = opts
+
+
+def _worker_explode_conv(payload: Tuple[str, List[Tuple[dict, str]]]) -> Tuple[str, int, List[dict]]:
+    """Explode all records in ONE conversation. Returns (conv_id, n_records, samples).
+
+    Top-level (not a closure) so multiprocessing can pickle the function ref.
+    """
+    conv_id, items = payload
+    render_cache: Dict[str, str] = {}
+    out: List[dict] = []
+    for record, cid in items:
+        out.extend(
+            explode_record(
+                record,
+                conversation_id=cid,
+                tokenizer=_WORKER_TOKENIZER,
+                max_len=_WORKER_OPTS["max_len"],
+                max_block_chars=_WORKER_OPTS["max_block_chars"],
+                dual_use_as_write=_WORKER_OPTS["dual_use_as_write"],
+                render_cache=render_cache,
+            )
+        )
+    return conv_id, len(items), out
+
+
+def _explode_parallel(
+    records: List[dict],
+    conv_ids: List[str],
+    tokenizer,
+    args: argparse.Namespace,
+    num_workers: int,
+    force_fallback: bool,
+) -> List[dict]:
+    """Explode all records, in parallel by conversation, with progress log.
+
+    ``num_workers <= 1`` → single-process path (with progress) so the fast path
+    is debuggable and small inputs don't pay process-pool startup cost.
+    """
+    # Group records by conversation so each worker keeps its render_cache hot
+    # within a conversation (this is where the cache hits actually live).
+    grouped: "OrderedDict[str, List[Tuple[dict,str]]]" = OrderedDict()
+    for r, cid in zip(records, conv_ids):
+        grouped.setdefault(cid, []).append((r, cid))
+    payloads = list(grouped.items())  # [(conv_id, [(record,cid), ...]), ...]
+    n_convs = len(payloads)
+    n_records = len(records)
+    opts = {
+        "max_len": args.max_len,
+        "max_block_chars": args.max_block_chars,
+        "dual_use_as_write": args.dual_use_as_write,
+    }
+
+    # --- Single-process path (with progress) ---------------------------------
+    if num_workers <= 1:
+        all_samples: List[dict] = []
+        render_cache: Dict[str, str] = {}  # global cache OK in single-process
+        done_records = 0
+        log_every = max(1, n_records // 20)  # ~20 progress lines total
+        next_log = log_every
+        t0 = time.time()
+        for conv_id, items in payloads:
+            for record, cid in items:
+                all_samples.extend(
+                    explode_record(
+                        record,
+                        conversation_id=cid,
+                        tokenizer=tokenizer,
+                        max_len=args.max_len,
+                        max_block_chars=args.max_block_chars,
+                        dual_use_as_write=args.dual_use_as_write,
+                        render_cache=render_cache,
+                    )
+                )
+                done_records += 1
+                if done_records >= next_log or done_records == n_records:
+                    elapsed = time.time() - t0
+                    rate = done_records / elapsed if elapsed > 0 else 0.0
+                    eta = (n_records - done_records) / rate if rate > 0 else 0.0
+                    print(
+                        f"[prepare_data]   progress: {done_records}/{n_records} records "
+                        f"({100*done_records/n_records:.0f}%) "
+                        f"| {len(all_samples)} samples so far "
+                        f"| {rate:.1f} rec/s | elapsed {elapsed:.1f}s | ETA {eta:.0f}s"
+                    )
+                    next_log = done_records + log_every
+        return all_samples
+
+    # --- Multi-process path --------------------------------------------------
+    import multiprocessing as mp
+
+    print(
+        f"[prepare_data] explode in PARALLEL: workers={num_workers} "
+        f"over {n_convs} conversations / {n_records} records "
+        f"(each worker loads its own tokenizer once)"
+    )
+    all_samples: List[dict] = []
+    done_convs = 0
+    done_records = 0
+    log_every = max(1, n_convs // 20)  # ~20 progress lines total
+    next_log = log_every
+    t0 = time.time()
+    # spawn is the safest start method (no fork-related state surprises with
+    # tokenizers / threads). chunksize=1 — each conversation is already a
+    # decent unit of work.
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(
+        processes=num_workers,
+        initializer=_worker_init,
+        initargs=(force_fallback, opts),
+    ) as pool:
+        for conv_id, n_recs_done, samples in pool.imap_unordered(
+            _worker_explode_conv, payloads, chunksize=1
+        ):
+            all_samples.extend(samples)
+            done_convs += 1
+            done_records += n_recs_done
+            if done_convs >= next_log or done_convs == n_convs:
+                elapsed = time.time() - t0
+                rate = done_records / elapsed if elapsed > 0 else 0.0
+                eta = (n_records - done_records) / rate if rate > 0 else 0.0
+                print(
+                    f"[prepare_data]   progress: {done_convs}/{n_convs} convs "
+                    f"({done_records}/{n_records} records, {100*done_records/n_records:.0f}%) "
+                    f"| {len(all_samples)} samples so far "
+                    f"| {rate:.1f} rec/s | elapsed {elapsed:.1f}s | ETA {eta:.0f}s"
+                )
+                next_log = done_convs + log_every
+    return all_samples
+
+
 def _resolve_conversation_ids(
     records: Sequence[dict], field: Optional[str]
 ) -> Tuple[List[str], str]:
@@ -493,25 +644,28 @@ def prepare(args: argparse.Namespace) -> Dict[str, Any]:
         f"(distinct session_id, the WRONG key: {len({r.get('session_id') for r in records})})"
     )
 
-    # --- §2.3 explode every record ---
-    # Render cache shared across ALL records so a context shared between records
-    # (common within one conversation) is rendered once. Speed-only memoization.
-    render_cache: Dict[str, str] = {}
-    all_samples: List[dict] = []
-    for record, cid in zip(records, conv_ids):
-        all_samples.extend(
-            explode_record(
-                record,
-                conversation_id=cid,
-                tokenizer=tokenizer,
-                max_len=args.max_len,
-                max_block_chars=args.max_block_chars,
-                dual_use_as_write=args.dual_use_as_write,
-                render_cache=render_cache,
-            )
-        )
+    # --- §2.3 explode every record (parallel over conversations) ----------
+    # Resolve worker count. Default: os.cpu_count() (fall back to 1). Cap at the
+    # number of conversations — more workers than convs would just sit idle.
+    requested_workers = args.num_workers if args.num_workers is not None else (os.cpu_count() or 1)
+    n_convs = len(set(conv_ids))
+    num_workers = max(1, min(requested_workers, n_convs))
+    if num_workers != requested_workers:
+        print(f"[prepare_data] num_workers capped {requested_workers} -> {num_workers} "
+              f"({n_convs} conversations is the upper bound)")
+
+    t_explode = time.time()
+    all_samples = _explode_parallel(
+        records=records,
+        conv_ids=conv_ids,
+        tokenizer=tokenizer,
+        args=args,
+        num_workers=num_workers,
+        force_fallback=force_fallback,
+    )
     n_exploded_raw = len(all_samples)
-    print(f"[prepare_data] exploded {n_records} records -> {n_exploded_raw} raw samples")
+    print(f"[prepare_data] exploded {n_records} records -> {n_exploded_raw} raw samples "
+          f"in {time.time()-t_explode:.1f}s (workers={num_workers})")
 
     # --- §2.3 dedup ---
     all_samples = dedup_samples(all_samples)
@@ -626,6 +780,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="optional override: use this record field as conversation_id if the "
         "source already has a real conversation/session grouping field (§8). "
         "Falls back to the derived id when absent.",
+    )
+    p.add_argument(
+        "--num-workers", type=int, default=None,
+        help="parallel worker processes for the explode/render stage. "
+             "Default: os.cpu_count() (use all cores). Set 1 to disable "
+             "parallelism (single-process, easier to debug). Capped at the "
+             "number of conversations.",
     )
     return p
 
