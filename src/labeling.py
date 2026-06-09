@@ -454,12 +454,32 @@ def render_context(
         return ""
 
     # --- Tail-preserving message-level pruning -----------------------------
-    # Render with the full set first; if it exceeds max_len, drop oldest whole
-    # messages until it fits (or only one message remains).
+    # We want the largest K such that "render+encode of the LAST K messages"
+    # fits in max_len tokens. The naive loop ("drop oldest one, re-encode all,
+    # repeat") is O(N^2) chars — for N=100 messages with long tool_results it
+    # re-encodes millions of chars. Use binary search instead: O(log N) renders
+    # and encodes total. Same result, vastly fewer encode calls.
     rendered = _apply_template(tokenizer, flat)
-    while _encode_len(tokenizer, rendered) > max_len and len(flat) > 1:
-        flat = flat[1:]  # drop the oldest message (left side)
-        rendered = _apply_template(tokenizer, flat)
+    if _encode_len(tokenizer, rendered) > max_len and len(flat) > 1:
+        # Invariant: keeping the LAST `lo` messages always fits;
+        #            keeping the LAST `hi` messages always exceeds.
+        # Initial bounds:
+        lo, hi = 1, len(flat)
+        # Anchor lo=1: a single (most recent) message renders to *something*;
+        # token-level safety net below handles the case where it still exceeds.
+        while hi - lo > 1:
+            mid = (lo + hi) // 2  # try keeping the LAST `mid` messages
+            cand = _apply_template(tokenizer, flat[-mid:])
+            if _encode_len(tokenizer, cand) <= max_len:
+                lo, rendered = mid, cand          # `mid` fits — keep it as best
+            else:
+                hi = mid                          # `mid` exceeds — too many
+        flat = flat[-lo:]
+        # `rendered` already corresponds to flat[-lo:] from the last successful
+        # candidate (or to the original full render if lo stayed at 1 and never
+        # updated; re-render once defensively).
+        if _encode_len(tokenizer, rendered) > max_len:
+            rendered = _apply_template(tokenizer, flat)
 
     # --- Token-level left-truncation safety net ----------------------------
     # A single remaining (most recent) message may still exceed max_len. Keep
@@ -597,7 +617,23 @@ def get_tokenizer(model_id: str = "Qwen/Qwen3-1.7B", allow_fallback: bool = True
     try:
         from transformers import AutoTokenizer  # local import: keep module import-light
 
-        tok = AutoTokenizer.from_pretrained(model_id)
+        # Force the Rust ``Qwen2TokenizerFast`` — it is 10-100x faster than the
+        # pure-Python ``Qwen2Tokenizer`` on long inputs (the bottleneck for
+        # prepare_data on large datasets). If a Fast variant is genuinely
+        # unavailable in this env, fall back to slow with a loud warning.
+        try:
+            tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+        except Exception as fast_exc:
+            print(f"[labeling] WARNING: fast tokenizer unavailable for {model_id} "
+                  f"({type(fast_exc).__name__}: {fast_exc}); falling back to the "
+                  f"slow Python tokenizer - prepare_data will be much slower. "
+                  f"Install the `tokenizers` package (e.g. `pip install -U tokenizers`) "
+                  f"to get the Rust fast tokenizer.")
+            tok = AutoTokenizer.from_pretrained(model_id, use_fast=False)
+        if not getattr(tok, "is_fast", False):
+            print(f"[labeling] WARNING: loaded tokenizer is type {type(tok).__name__} "
+                  f"(is_fast=False) - prepare_data will be slow. Install/upgrade "
+                  f"the `tokenizers` package for the Rust fast variant.")
         _QWEN_TOKENIZER_CACHE[model_id] = tok
         return tok
     except Exception as exc:  # pragma: no cover - environment dependent
