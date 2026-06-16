@@ -79,25 +79,34 @@ def load_jsonl(path: str) -> List[dict]:
 
 
 def load_input(path: str) -> List[dict]:
-    """Load records from a JSONL file OR a directory of JSON files.
+    """Load records from a JSONL file OR a directory of JSON/JSONL files.
 
     - If ``path`` is a ``.jsonl`` file (or any file): parse it as JSONL — one
       record per non-blank line.
-    - If ``path`` is a directory: treat **each ``.json`` file in it as one
-      record** (i.e. one JSONL line). Files are processed in sorted order for
-      reproducibility; sub-directories are NOT recursed. A ``.json`` file that
-      itself contains a JSON array is flattened (each element becomes a record).
+    - If ``path`` is a directory: load **both ``.json`` and ``.jsonl`` files**
+      in it. Files are processed in sorted order for reproducibility;
+      sub-directories are NOT recursed.
+        * a ``.json`` file → one record (or, if it contains a JSON array, each
+          element becomes a record);
+        * a ``.jsonl`` file → parsed line-by-line (each non-blank line is one
+          record, i.e. many records per file).
     """
     if os.path.isdir(path):
         records: List[dict] = []
-        names = sorted(n for n in os.listdir(path) if n.endswith(".json"))
+        names = sorted(
+            n for n in os.listdir(path)
+            if n.endswith(".json") or n.endswith(".jsonl")
+        )
         if not names:
             raise ValueError(
-                f"--input directory '{path}' contains no .json files "
-                "(expected one .json per record)."
+                f"--input directory '{path}' contains no .json or .jsonl files "
+                "(expected one .json per record, or .jsonl with one record per line)."
             )
         for name in names:
             fpath = os.path.join(path, name)
+            if name.endswith(".jsonl"):
+                records.extend(load_jsonl(fpath))  # JSONL → many records
+                continue
             with open(fpath, "r", encoding="utf-8") as f:
                 obj = json.load(f)
             if isinstance(obj, list):

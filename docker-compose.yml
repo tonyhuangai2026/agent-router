@@ -1,0 +1,87 @@
+# Local containerized training orchestration — Tech Design §2/§3/§5.
+#
+# One image (qwen-classifier:local, built from docker/Dockerfile) is shared by
+# every service via the `x-common` YAML anchor below. Each service just runs the
+# entrypoint with a different stage arg: prepare | train | evaluate | all.
+#
+# Usage (host needs NO GPU — torch in the base image falls back to CPU):
+#   docker compose run --rm prepare      # data/prepare_data.py  -> ./outputs/prepared
+#   docker compose run --rm train        # src/train.py          -> ./outputs/model
+#   docker compose run --rm evaluate     # src/evaluate.py       -> ./outputs/report
+#   docker compose run --rm all          # prepare -> train -> evaluate
+#
+# GPU (only on a host with an NVIDIA GPU + nvidia-container-toolkit):
+#   docker compose --profile gpu run --rm train-gpu
+#
+# Tune hyper-parameters WITHOUT editing this file: copy .env.example to .env and
+# edit, or export shell env vars (e.g. `MAX_STEPS=2 docker compose run --rm train`).
+# The `${VAR:-default}` syntax means an unset/empty var uses the default here, and
+# the entrypoint only appends a CLI flag when its env var is non-empty (so empty
+# values fall through to each script's own argparse default).
+#
+# NOTE: the obsolete top-level `version:` key is intentionally omitted (Compose v2
+# warns on it).
+
+# Shared build + image + volumes + env, reused by all services to avoid repetition.
+x-common: &common
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  image: qwen-classifier:local
+  volumes:
+    # Raw input data, read-only (Tech Design §3). prepare reads from /data.
+    - ./data:/data:ro
+    # Pipeline artifacts, written back to the host under ./outputs/ (Tech Design §3).
+    - ./outputs/prepared:/work/prepared
+    - ./outputs/model:/work/model
+    - ./outputs/report:/work/report
+  environment:
+    # --- train / shared ---
+    - MODEL_ID=${MODEL_ID:-Qwen/Qwen3-1.7B}   # base model id (HF hub or local path)
+    - EPOCHS=${EPOCHS:-}                       # train epochs; empty -> train.py default
+    - MAX_STEPS=${MAX_STEPS:-}                 # cap train steps (e.g. 2 for a smoke run); empty -> default
+    - PER_DEVICE_BATCH=${PER_DEVICE_BATCH:-}   # per-device train batch size; empty -> default
+    - MAX_LEN=${MAX_LEN:-}                     # max sequence length (tokens); empty -> default
+    # --- prepare ---
+    - INPUT_FILE=${INPUT_FILE:-/data}          # prepare input file/dir inside the container (mounted from ./data)
+    - PREPARE_FORCE_FALLBACK=${PREPARE_FORCE_FALLBACK:-}  # =1 -> offline lightweight tokenizer (no model download)
+    # --- evaluate ---
+    - EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-}     # evaluate batch size; empty -> evaluate.py default (8)
+    - EVAL_MAX_NEW_TOKENS=${EVAL_MAX_NEW_TOKENS:-}  # generation length for evaluate; empty -> default (16)
+    - EVAL_SYNTHETIC=${EVAL_SYNTHETIC:-}       # =1 -> offline synthetic eval (no trained model required)
+
+services:
+  # Stage 1: build prepared train/val/test splits from raw ./data.
+  prepare:
+    <<: *common
+    command: prepare
+
+  # Stage 2: LoRA-SFT fine-tune (CPU by default; falls back automatically with no GPU).
+  train:
+    <<: *common
+    command: train
+
+  # Stage 3: evaluate the trained model and write the report.
+  evaluate:
+    <<: *common
+    command: evaluate
+
+  # Convenience: run the whole pipeline (prepare -> train -> evaluate) in one container.
+  all:
+    <<: *common
+    command: all
+
+  # GPU variant of train — only started with `--profile gpu`, so the default
+  # (CPU) services above work on a host with NO GPU. Requires an NVIDIA GPU and
+  # the nvidia-container-toolkit on the host (Tech Design §2.5).
+  train-gpu:
+    <<: *common
+    profiles: ["gpu"]
+    command: train
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

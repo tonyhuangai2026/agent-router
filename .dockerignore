@@ -1,0 +1,26 @@
+# Keep the build context small and never bake outputs / secrets / data into the
+# image (Tech Design §3, §7). Raw data and outputs are mounted at runtime.
+
+# Outputs and run artifacts (regenerated; mounted as volumes)
+outputs/
+data/prepared/
+report/
+
+# Model artifacts
+*.tar.gz
+*.safetensors
+
+# Python caches (match at any depth, e.g. src/__pycache__/)
+__pycache__/
+**/__pycache__/
+*.pyc
+**/*.pyc
+
+# VCS
+.git/
+
+# Secrets / keys — NEVER bake into an image
+*_deploy_key*
+id_rsa*
+id_ed25519*
+.env

@@ -28,3 +28,6 @@ id_ed25519*
 # OS / editor
 .DS_Store
 *.swp
+
+# Local container run outputs (volume-mounted; regenerated per run)
+outputs/
