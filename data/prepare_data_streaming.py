@@ -330,6 +330,10 @@ class BucketReservoir:
     def bucket_counts(self) -> Dict[str, int]:
         return {b: len(self._res[b]) for b in BUCKET_NAMES}
 
+    def is_full(self) -> bool:
+        """True once every bucket has reached capacity."""
+        return all(len(self._res[b]) >= self.capacity for b in BUCKET_NAMES)
+
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -389,12 +393,26 @@ def prepare(args: argparse.Namespace) -> Dict[str, Any]:
     print(f"[prepare_streaming] per-bucket capacity: train={train_cap} "
           f"val={val_cap} test={test_cap} (x{len(BUCKET_NAMES)} buckets)")
 
+    # Early-stop config (opt-in). --max-records is a hard cap on records scanned.
+    # --early-stop stops once ALL reservoirs are full, but only after a GRACE
+    # window of extra records past the first-full point — the grace lets
+    # reservoir sampling mix in later data so we don't bias toward whichever
+    # records happened to appear first (important if the input is time/project
+    # ordered). Grace defaults to a multiple of total capacity.
+    max_records = args.max_records if args.max_records and args.max_records > 0 else None
+    total_capacity = sum(r.capacity * len(BUCKET_NAMES) for r in reservoirs.values())
+    grace = args.early_stop_grace if args.early_stop_grace is not None else 0
+    if args.early_stop and grace == 0:
+        grace = max(10000, total_capacity * 5)  # sane default mixing window
+    first_full_at: Optional[int] = None
+
     # Streaming scan: one record at a time -> assign split -> explode -> offer.
     n_records = 0
     n_samples_seen = 0
     split_conv_ids: Dict[str, set] = {"train": set(), "val": set(), "test": set()}
     t0 = time.time()
     log_every = max(1, args.log_every)
+    stop_reason = "input exhausted"
 
     for record in iter_records(args.input):
         n_records += 1
@@ -419,6 +437,24 @@ def prepare(args: argparse.Namespace) -> Dict[str, Any]:
             kept = sum(sum(r.bucket_counts().values()) for r in reservoirs.values())
             print(f"[prepare_streaming]   {n_records} records | {n_samples_seen} samples seen "
                   f"| {kept} kept | {rate:.0f} rec/s | elapsed {el:.0f}s")
+
+        # --- early stop checks (after offering, so this record counts) --------
+        if max_records is not None and n_records >= max_records:
+            stop_reason = f"--max-records {max_records} reached"
+            break
+        if args.early_stop:
+            all_full = all(r.is_full() for r in reservoirs.values())
+            if all_full and first_full_at is None:
+                first_full_at = n_records
+                print(f"[prepare_streaming]   all reservoirs full at {n_records} "
+                      f"records; scanning +{grace} more (grace) then stopping")
+            if first_full_at is not None and n_records - first_full_at >= grace:
+                stop_reason = (f"--early-stop: reservoirs full at {first_full_at}, "
+                               f"+{grace} grace records mixed in")
+                break
+
+    print(f"[prepare_streaming] scan stopped: {stop_reason} "
+          f"({n_records} records, {n_samples_seen} samples seen)")
 
     # Leakage check: a conversation_id must not appear in more than one split.
     # By construction assign_split is a pure function of conv_id, so this holds;
@@ -468,6 +504,13 @@ def prepare(args: argparse.Namespace) -> Dict[str, Any]:
         "mode": "streaming-reservoir",
         "input": args.input,
         "balance_target": args.balance_target,
+        "stop_reason": stop_reason,
+        "early_stop": {
+            "enabled": bool(args.early_stop),
+            "grace_records": grace if args.early_stop else None,
+            "first_full_at_record": first_full_at,
+            "max_records": max_records,
+        },
         "seed": args.seed,
         "records_scanned": n_records,
         "samples_seen": n_samples_seen,
@@ -517,6 +560,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--real-tokenizer", dest="real_tokenizer", action="store_true", default=False,
                    help="load real Qwen3 tokenizer (default off: char-estimate is identical & ~28x faster)")
     p.add_argument("--log-every", type=int, default=1000, help="progress log cadence (records)")
+    p.add_argument("--early-stop", dest="early_stop", action="store_true", default=False,
+                   help="stop scanning once ALL length buckets are full (after a grace "
+                        "window of extra records, so later data still gets mixed in). "
+                        "Use when balance-target is much smaller than the corpus.")
+    p.add_argument("--early-stop-grace", type=int, default=None,
+                   help="with --early-stop: how many EXTRA records to scan after the "
+                        "reservoirs first fill, before stopping (mixing window to avoid "
+                        "order bias). Default: max(10000, 5x total capacity).")
+    p.add_argument("--max-records", type=int, default=None,
+                   help="hard cap: stop after scanning this many records regardless of "
+                        "fill state (a simple 'just scan N records' knob).")
     return p
 
 
