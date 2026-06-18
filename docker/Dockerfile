@@ -19,6 +19,7 @@ WORKDIR /app
 # (src/, data/) so module imports resolve exactly as outside the container.
 COPY src/ /app/src/
 COPY data/prepare_data.py /app/data/prepare_data.py
+COPY data/prepare_data_streaming.py /app/data/prepare_data_streaming.py
 
 # LoRA-SFT stack layered on top of the base torch + numpy/matplotlib for the
 # evaluate report plots. torch is deliberately absent from requirements.txt.

@@ -1,0 +1,80 @@
+# Blackwell / g7e training image (CUDA 12.8 + PyTorch 2.7, supports sm_120).
+#
+# WHY THIS EXISTS
+# ---------------
+# ml.g7e.* uses the NVIDIA RTX PRO 6000 **Blackwell** GPU (compute capability
+# **sm_120**). The default image (docker/Dockerfile, PyTorch 2.6 / CUDA 12.6)
+# does NOT contain CUDA kernels for sm_120 — its arch list tops out at sm_90
+# (Hopper) — so on g7e it crashes at the first kernel launch with:
+#     RuntimeError: CUDA error: no kernel image is available for execution on the device
+# Blackwell support requires **CUDA 12.8 + PyTorch >= 2.7** (the cu128 wheels are
+# the first stable builds that ship sm_120 kernels).
+#
+# This image is ONLY needed for Blackwell GPUs (g7e). For A10G (g5) / L4 (g6) /
+# L40S (g6e) keep using docker/Dockerfile — it's smaller and proven.
+#
+# BUILD & PUSH (run on a machine with Docker; ECR login first):
+#   ACCOUNT=<your-aws-account-id>; REGION=us-east-1
+#   aws ecr create-repository --repository-name qwen-classifier --region $REGION 2>/dev/null || true
+#   aws ecr get-login-password --region $REGION | docker login --username AWS \
+#       --password-stdin $ACCOUNT.dkr.ecr.$REGION.amazonaws.com
+#   docker build -f docker/Dockerfile.blackwell -t qwen-classifier:blackwell .
+#   docker tag qwen-classifier:blackwell $ACCOUNT.dkr.ecr.$REGION.amazonaws.com/qwen-classifier:blackwell
+#   docker push $ACCOUNT.dkr.ecr.$REGION.amazonaws.com/qwen-classifier:blackwell
+# Then point config.yaml image.image_uri at that ECR URI and set
+# compute.instance_type: ml.g7e.2xlarge  (see README §8 / runbook).
+#
+# NOTE: this image was authored from NVIDIA/PyTorch's documented Blackwell
+# support matrix (CUDA 12.8 / PyTorch 2.7 cu128). It could not be GPU-tested on
+# the build host (no Blackwell card available here) — verify on a g7e instance.
+
+# CUDA 12.8 runtime base (cuDNN included). Blackwell kernels live in the cu128
+# PyTorch wheels installed below, not in the base itself.
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Python 3.12 + pip (Ubuntu 22.04 ships 3.10; add the deadsnakes PPA for 3.12 to
+# match the default image's py312, then make it the default python/python3).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common ca-certificates && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3.12-dev curl && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 && \
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python && \
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python3 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Project code only — outputs/ and raw data are mounted at runtime (Tech Design §3).
+COPY src/ /app/src/
+COPY data/prepare_data.py /app/data/prepare_data.py
+COPY data/prepare_data_streaming.py /app/data/prepare_data_streaming.py
+
+# 1) PyTorch 2.7 built for CUDA 12.8 (cu128) — THIS is what carries the sm_120
+#    (Blackwell) kernels. Installed explicitly from the cu128 index.
+# 2) The LoRA-SFT stack on top. src/requirements.txt intentionally omits torch,
+#    so it will NOT clobber the cu128 build we just installed.
+RUN python -m pip install --upgrade pip && \
+    python -m pip install --index-url https://download.pytorch.org/whl/cu128 \
+        "torch==2.7.*" && \
+    python -m pip install -r src/requirements.txt && \
+    python -m pip install numpy matplotlib
+
+# Placeholder mount points for prepared data / model / report (Tech Design §3).
+RUN mkdir -p /work/prepared /work/model /work/report
+
+# Same stage dispatcher as the default image: prepare | train | evaluate | all.
+COPY docker/entrypoint.sh /app/docker/entrypoint.sh
+RUN chmod +x /app/docker/entrypoint.sh
+
+# Fail fast at build time if torch can't even import; the real sm_120 check must
+# happen on an actual g7e GPU (see README runbook).
+RUN python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'arch', torch.cuda.get_arch_list())" || true
+
+ENTRYPOINT ["bash", "/app/docker/entrypoint.sh"]
+CMD ["all"]

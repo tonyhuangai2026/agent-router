@@ -280,6 +280,49 @@ aws cloudwatch get-metric-statistics --namespace /aws/sagemaker/TrainingJobs \
    ```
    其它都不用动。48GB 的 L40S 还能把 `hyperparameters.max_len` 调回 4096、或加大 `per_device_batch`。CloudWatch 监控保持不变。
 
+### 6.5 Blackwell 新卡（`ml.g7e.*`）—— 需要专用镜像
+
+> ⚠️ **`ml.g7e.*` 不能直接用默认 DLC 镜像。** g7e 用的是 **NVIDIA RTX PRO 6000 Blackwell** GPU（计算能力 **sm_120**）。默认镜像（PyTorch 2.6 / CUDA 12.6，§6 表格那个）的 CUDA kernel 只覆盖到 sm_90（Hopper），**没有 sm_120 的 kernel**，在 g7e 上一启动就报：
+> ```
+> RuntimeError: CUDA error: no kernel image is available for execution on the device
+> ```
+> 这**不是代码 bug**，是「卡太新、镜像里的 PyTorch 太老」。Blackwell 需要 **CUDA 12.8 + PyTorch ≥ 2.7**（cu128 wheel 是首个带 sm_120 kernel 的稳定版）。
+
+**解决：用仓库提供的 Blackwell 自建镜像 `docker/Dockerfile.blackwell`**（base = `nvidia/cuda:12.8.1` + 安装 `torch==2.7.* (cu128)`），build 后推到你的 ECR，再让 SageMaker 用它：
+
+```bash
+ACCOUNT=<你的AWS账号>; REGION=us-east-1
+aws ecr create-repository --repository-name qwen-classifier --region $REGION 2>/dev/null || true
+aws ecr get-login-password --region $REGION | docker login --username AWS \
+    --password-stdin $ACCOUNT.dkr.ecr.$REGION.amazonaws.com
+
+# 在仓库根目录 build（建议在带 Blackwell 卡的机器上 build+自测）
+docker build -f docker/Dockerfile.blackwell -t qwen-classifier:blackwell .
+docker tag qwen-classifier:blackwell $ACCOUNT.dkr.ecr.$REGION.amazonaws.com/qwen-classifier:blackwell
+docker push $ACCOUNT.dkr.ecr.$REGION.amazonaws.com/qwen-classifier:blackwell
+```
+
+然后改 `config.yaml`：
+
+```yaml
+compute:
+  instance_type: "ml.g7e.2xlarge"        # 同样需先在 Service Quotas 申请 g7e 配额
+image:
+  image_uri: "<ACCOUNT>.dkr.ecr.us-east-1.amazonaws.com/qwen-classifier:blackwell"
+```
+
+**上 g7e 前先验证镜像认得这块卡**（在 g7e 实例上跑）：
+```python
+import torch
+print(torch.__version__, torch.version.cuda)
+print(torch.cuda.get_device_capability())  # g7e 期望 (12, 0)
+print("sm_120" in "".join(torch.cuda.get_arch_list()))  # 应为 True
+```
+
+> **如实说明**：`Dockerfile.blackwell` 依据 NVIDIA/PyTorch 官方 Blackwell 支持矩阵（CUDA 12.8 / PyTorch 2.7 cu128）编写，但**未能在本仓库的构建机上做 GPU 实测**（无 Blackwell 卡）——请在 g7e 上用上面的命令确认后再正式训练。
+>
+> **更省事的替代**：1.7B LoRA 这种小模型在 **`ml.g5.2xlarge`（A10G）上几分钟就训完**，没必要上 Blackwell。除非客户只有 g7e 配额或要训更大模型，否则直接用 §6 默认的 g5 + 现成 DLC 镜像最稳。
+
 ---
 
 ## 7. 本地容器训练（不依赖 SageMaker）

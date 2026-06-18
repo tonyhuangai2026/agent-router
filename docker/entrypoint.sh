@@ -24,6 +24,21 @@ run_prepare() {
         --outdir /work/prepared
 }
 
+run_prepare_streaming() {
+    banner "STAGE: prepare-streaming  (data/prepare_data_streaming.py → /work/prepared)"
+    # For huge inputs (100GB+): constant-memory streaming, bucket-balanced
+    # reservoir sampling, leakage-free split. Knobs via env (flag appended only
+    # when set). PREPARE_FORCE_FALLBACK passes through automatically.
+    local args=(--input "${INPUT_FILE:-/data}" --outdir /work/prepared)
+    [ -n "${BALANCE_TARGET:-}" ]    && args+=(--balance-target "${BALANCE_TARGET}")
+    [ -n "${MAX_LEN:-}" ]           && args+=(--max-len "${MAX_LEN}")
+    [ "${EARLY_STOP:-}" = "1" ]     && args+=(--early-stop)
+    [ -n "${EARLY_STOP_GRACE:-}" ]  && args+=(--early-stop-grace "${EARLY_STOP_GRACE}")
+    [ -n "${MAX_RECORDS:-}" ]       && args+=(--max-records "${MAX_RECORDS}")
+    [ "${NO_PROGRESS:-}" = "1" ]    && args+=(--no-progress)
+    python data/prepare_data_streaming.py "${args[@]}"
+}
+
 run_train() {
     banner "STAGE: train  (src/train.py → /work/model)"
     local args=(--train_dir /work/prepared --val_dir /work/prepared --output_dir /work/model)
@@ -56,6 +71,9 @@ case "${stage}" in
     prepare)
         run_prepare
         ;;
+    prepare-streaming)
+        run_prepare_streaming
+        ;;
     train)
         run_train
         ;;
@@ -71,7 +89,7 @@ case "${stage}" in
         ;;
     *)
         echo "ERROR: unknown stage '${stage}'." >&2
-        echo "Valid stages: prepare | train | evaluate | all (default all)." >&2
+        echo "Valid stages: prepare | prepare-streaming | train | evaluate | all (default all)." >&2
         exit 2
         ;;
 esac
