@@ -173,22 +173,40 @@ def _make_completion(w: int, t: int) -> str:
     return json.dumps({"w": w, "t": t}, separators=(",", ":"))
 
 
-def explode_record(
+def _raw_ctx_key(context_messages: List[dict]) -> str:
+    """Cheap, render-free dedup/cache key for a context message-list.
+
+    ``render_context`` is a pure function of (context_messages, max_len,
+    max_block_chars), so identical raw contexts always render to identical
+    prompts. Hashing the raw context lets us dedup BEFORE rendering (so we never
+    pay the expensive render for samples that will be dropped) and acts as the
+    per-record render cache key.
+    """
+    return hashlib.sha1(
+        json.dumps(context_messages, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def explode_record_light(
     record: dict,
     conversation_id: str,
     tokenizer,
-    max_len: int = 4096,
-    max_block_chars: int = 4000,
     dual_use_as_write: bool = True,
 ) -> List[dict]:
-    """Explode ONE record into (context -> {w,t}) samples.
+    """Explode ONE record into LIGHTWEIGHT samples — NO prompt render yet.
 
-    Same logic & labels as ``prepare_data.explode_record`` (it reuses the SAME
-    ``labeling`` functions), minus the per-conversation render cache (streaming
-    processes records independently). Each assistant turn in the history becomes
-    a sample whose context is the strictly-prior messages; the top-level
-    ``response`` is the final sample (carrying ``usage.output_tokens`` as a
-    reference-only column, null for historical turns).
+    This is the cheap half of the two-phase pipeline. We compute only the labels
+    ``w`` and ``t`` (char-estimate, ~5ms/record) and keep a REFERENCE to the raw
+    context message-list. The expensive ``render_context`` (~97% of cost) is
+    deferred to :func:`realize_prompt`, called ONLY for samples the reservoir
+    actually keeps (~balance_target total) instead of for every exploded sample
+    (which can be tens of millions, almost all discarded).
+
+    Dedup key is ``_raw_ctx_key`` (render-free) — equivalent to hashing the
+    rendered prompt since render is a pure function of the raw context.
+
+    Each light sample carries ``_ctx`` (the raw context list) so the prompt can
+    be realized later; ``_ctx`` is stripped before writing to disk.
     """
     request = record.get("request") or {}
     messages = request.get("messages") or []
@@ -200,18 +218,14 @@ def explode_record(
     def _emit(context_messages, turn_content, usage_tokens):
         w = 1 if labeling.is_write_response(turn_content, dual_use_as_write=dual_use_as_write) else 0
         t = labeling.count_output_tokens(turn_content, tokenizer)  # char-estimate
-        prompt = labeling.render_context(
-            context_messages, tokenizer, max_len=max_len, max_block_chars=max_block_chars
-        )
         samples.append({
-            "prompt": prompt,
-            "completion": _make_completion(w, t),
             "w": w,
             "t": t,
             "conversation_id": conversation_id,
             "session_id": session_id,
             "usage_output_tokens": usage_tokens,
-            "_ctx_hash": _context_hash(prompt),
+            "_ctx": context_messages,           # raw context (for deferred render)
+            "_ctx_hash": _raw_ctx_key(context_messages),  # render-free dedup key
         })
 
     # 1) Every assistant turn in the history; context = strictly-prior messages.
@@ -230,6 +244,37 @@ def explode_record(
     _emit(list(messages), resp_content, usage_tokens)
 
     return samples
+
+
+def realize_prompt(
+    sample: dict,
+    tokenizer,
+    max_len: int,
+    max_block_chars: int,
+    render_cache: Optional[Dict[str, str]] = None,
+) -> dict:
+    """Turn a kept LIGHT sample into a final sample by rendering its prompt.
+
+    Called ONLY for reservoir-kept samples. Renders ``_ctx`` -> ``prompt`` (with
+    an optional per-record cache keyed by ``_ctx_hash``), builds ``completion``,
+    and drops the internal ``_ctx`` (the bulky raw context) so the in-memory
+    reservoir stays small. The dedup key ``_ctx_hash`` is preserved for the
+    reservoir's own dedup bookkeeping (stripped at write time).
+    """
+    ctx = sample.pop("_ctx", [])
+    key = sample.get("_ctx_hash")
+    prompt = None
+    if render_cache is not None and key is not None:
+        prompt = render_cache.get(key)
+    if prompt is None:
+        prompt = labeling.render_context(
+            ctx, tokenizer, max_len=max_len, max_block_chars=max_block_chars
+        )
+        if render_cache is not None and key is not None:
+            render_cache[key] = prompt
+    sample["prompt"] = prompt
+    sample["completion"] = _make_completion(sample["w"], sample["t"])
+    return sample
 
 
 # ---------------------------------------------------------------------------
@@ -356,9 +401,12 @@ def prepare(args: argparse.Namespace) -> Dict[str, Any]:
         conv_id = labeling.derive_conversation_id(record)
         split = assign_split(conv_id, args.val_frac, args.test_frac, args.seed)
         split_conv_ids[split].add(conv_id)
-        samples = explode_record(
+        # Two-phase: explode LIGHT (labels only, no render) -> reservoir decides
+        # what to keep using only (w, t) -> render is deferred to write time for
+        # the kept set only. This avoids rendering the (vast) majority of samples
+        # that get discarded — render is ~97% of per-sample cost.
+        samples = explode_record_light(
             record, conversation_id=conv_id, tokenizer=tokenizer,
-            max_len=args.max_len, max_block_chars=args.max_block_chars,
             dual_use_as_write=args.dual_use_as_write,
         )
         res = reservoirs[split]
@@ -383,6 +431,19 @@ def prepare(args: argparse.Namespace) -> Dict[str, Any]:
     assert not any(overlaps.values()), (
         "conversation_id leakage across splits! " + json.dumps(overlaps, ensure_ascii=False)
     )
+
+    # Realize prompts ONLY for the kept set (deferred render). This is where the
+    # expensive render_context runs — on ~balance_target samples, not the
+    # millions seen. Done once, at the end, after the reservoir has settled.
+    n_kept_total = sum(sum(r.bucket_counts().values()) for r in reservoirs.values())
+    print(f"[prepare_streaming] rendering prompts for {n_kept_total} kept samples "
+          f"(deferred render — only the kept set)...")
+    t_render0 = time.time()
+    render_cache: Dict[str, str] = {}
+    for split in ("train", "val", "test"):
+        for s in reservoirs[split].samples():
+            realize_prompt(s, tokenizer, args.max_len, args.max_block_chars, render_cache)
+    print(f"[prepare_streaming] rendered {n_kept_total} prompts in {time.time()-t_render0:.1f}s")
 
     # Write splits + stats.
     out_counts: Dict[str, Any] = {}
