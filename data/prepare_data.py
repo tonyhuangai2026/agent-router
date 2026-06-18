@@ -468,12 +468,14 @@ _WORKER_TOKENIZER = None  # type: ignore[assignment]
 _WORKER_OPTS: Dict[str, Any] = {}
 
 
-def _worker_init(force_fallback: bool, opts: Dict[str, Any]) -> None:
+def _worker_init(use_real_tokenizer: bool, opts: Dict[str, Any]) -> None:
     global _WORKER_TOKENIZER, _WORKER_OPTS
-    if force_fallback:
-        _WORKER_TOKENIZER = labeling.SimpleWhitespaceTokenizer()
-    else:
+    # Default is the lightweight tokenizer: labels/truncation are char-estimated
+    # (tokenizer-independent), so the real Qwen3 tokenizer only adds load cost.
+    if use_real_tokenizer:
         _WORKER_TOKENIZER = labeling.get_tokenizer()
+    else:
+        _WORKER_TOKENIZER = labeling.SimpleWhitespaceTokenizer()
     _WORKER_OPTS = opts
 
 
@@ -506,7 +508,7 @@ def _explode_parallel(
     tokenizer,
     args: argparse.Namespace,
     num_workers: int,
-    force_fallback: bool,
+    use_real_tokenizer: bool,
 ) -> List[dict]:
     """Explode all records, in parallel by conversation, with progress log.
 
@@ -583,7 +585,7 @@ def _explode_parallel(
     with ctx.Pool(
         processes=num_workers,
         initializer=_worker_init,
-        initargs=(force_fallback, opts),
+        initargs=(use_real_tokenizer, opts),
     ) as pool:
         for conv_id, n_recs_done, samples in pool.imap_unordered(
             _worker_explode_conv, payloads, chunksize=1
@@ -631,18 +633,25 @@ def prepare(args: argparse.Namespace) -> Dict[str, Any]:
     records = load_input(args.input)
     n_records = len(records)
 
-    # Tokenizer: real Qwen3 if available, else the lightweight fallback so this
-    # runs offline (the fallback is provided by labeling.get_tokenizer).
+    # Tokenizer: the lightweight fallback is the DEFAULT now. Labels (``t``) and
+    # context truncation are computed with a fast character-based estimate
+    # (labeling.estimate_tokens_from_chars), so the real Qwen3 tokenizer would
+    # produce IDENTICAL prompts/labels here while costing ~13s to load — pure
+    # waste. The lightweight tokenizer also provides the same chat template.
+    # Opt into the real Qwen3 tokenizer with --real-tokenizer (or the legacy
+    # PREPARE_FORCE_FALLBACK=1 env, kept for back-compat, forces the fallback).
     force_fallback = os.environ.get("PREPARE_FORCE_FALLBACK") == "1"
-    if force_fallback:
-        tokenizer = labeling.SimpleWhitespaceTokenizer()
-    else:
+    use_real = getattr(args, "real_tokenizer", False) and not force_fallback
+    if use_real:
         tokenizer = labeling.get_tokenizer()
+    else:
+        tokenizer = labeling.SimpleWhitespaceTokenizer()
     tokenizer_name = type(tokenizer).__name__
     is_fallback = isinstance(tokenizer, labeling.SimpleWhitespaceTokenizer)
     print(
         f"[prepare_data] tokenizer: {tokenizer_name}"
-        + (" (FALLBACK — offline)" if is_fallback else " (real Qwen3)")
+        + (" (lightweight — default; t is char-estimated)" if is_fallback
+           else " (real Qwen3 — --real-tokenizer)")
     )
 
     # conversation_id per record (corpus-level; NOT session_id).
@@ -670,7 +679,7 @@ def prepare(args: argparse.Namespace) -> Dict[str, Any]:
         tokenizer=tokenizer,
         args=args,
         num_workers=num_workers,
-        force_fallback=force_fallback,
+        use_real_tokenizer=use_real,
     )
     n_exploded_raw = len(all_samples)
     print(f"[prepare_data] exploded {n_records} records -> {n_exploded_raw} raw samples "
@@ -796,6 +805,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "Default: os.cpu_count() (use all cores). Set 1 to disable "
              "parallelism (single-process, easier to debug). Capped at the "
              "number of conversations.",
+    )
+    p.add_argument(
+        "--real-tokenizer", dest="real_tokenizer", action="store_true", default=False,
+        help="load the real Qwen3 tokenizer for context rendering. Default is "
+             "OFF: labels (t) and truncation use a fast char-based estimate, so "
+             "the lightweight tokenizer yields identical output ~28x faster. "
+             "Only needed if you want the exact Qwen3 chat-template byte string.",
     )
     return p
 

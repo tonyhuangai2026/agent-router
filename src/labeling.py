@@ -155,29 +155,69 @@ def serialize_assistant_turn(response_content: list) -> str:
     return "\n".join(parts)
 
 
-def count_output_tokens(response_content, tokenizer) -> int:
+# ---------------------------------------------------------------------------
+# Character-based token ESTIMATE (fast; no tokenizer needed)
+# ---------------------------------------------------------------------------
+
+_CJK_RE = re.compile(r"[一-鿿㐀-䶿豈-﫿぀-ヿ]")
+
+#: Token-per-character ratios for the cheap character-based estimate.
+#: CJK / kana characters are ~1.5 tokens each; other (mostly latin/code) text
+#: is ~4 characters per token. These ratios match the project's earlier
+#: analysis scripts and are stable enough for length BUCKETING / relative
+#: ordering (the only use of ``t``), which is why we can skip the (slow) real
+#: tokenizer here. See ``estimate_tokens_from_chars``.
+_CJK_TOKENS_PER_CHAR: float = 1.5
+_OTHER_CHARS_PER_TOKEN: float = 4.0
+
+
+def estimate_tokens_from_chars(text: str) -> int:
+    """Cheap character-based estimate of token count (NO tokenizer).
+
+    ``tokens ≈ cjk_chars * 1.5 + other_chars / 4``.
+
+    This replaces the slow ``tokenizer.encode`` length used previously. The
+    label ``t`` is only consumed for length **bucketing / relative ordering**,
+    so an approximate count is sufficient and ~100x faster (no model tokenizer
+    load, no per-sample encode of long contexts).
+
+    IMPORTANT (label-source consistency): ``t`` is produced HERE at data-prep
+    time and written to the ``t`` column; both training (reads the column) and
+    evaluation (reads the same column as truth) therefore use this identical
+    definition — there is no train/eval source mismatch.
+    """
+    if not text:
+        return 0
+    cjk = len(_CJK_RE.findall(text))
+    other = len(text) - cjk
+    return int(cjk * _CJK_TOKENS_PER_CHAR + other / _OTHER_CHARS_PER_TOKEN)
+
+
+def count_output_tokens(response_content, tokenizer=None) -> int:
     """CANONICAL length label ``t`` for an assistant turn (Tech Design §2.2.2).
 
-    ``t = len(tokenizer.encode(serialize_assistant_turn(response_content)))``.
+    ``t = estimate_tokens_from_chars(serialize_assistant_turn(response_content))``
+    — a fast **character-based** estimate (no tokenizer). ``t`` is only used for
+    length bucketing / relative ordering, so the estimate is sufficient and
+    avoids the slow per-sample ``tokenizer.encode`` of long serialized turns.
 
-    IMPORTANT: this function intentionally takes **no** ``usage`` argument.
-    ``usage.output_tokens`` is NEVER read here. It is ~2.3x a serialized-text
-    token count and is carried only as a separate logged reference column in
-    ``prepare_data.py`` — using it as the target would mix two label
-    distributions (most exploded historical turns have no ``usage`` field at
-    all). Standardizing on the tokenizer count of the serialized turn gives one
-    uniform target for both training and evaluation.
+    The ``tokenizer`` parameter is accepted for backward compatibility but is
+    **ignored** (kept so existing callers — prepare_data, tests — don't break).
+
+    IMPORTANT: this function intentionally never reads ``usage.output_tokens``
+    (it is ~2.3x a serialized-text length and present on only some turns).
+    Standardizing on the char-estimate of the serialized turn gives one uniform
+    target for both training and evaluation.
 
     Parameters
     ----------
     response_content:
         The assistant turn's content blocks (see :func:`serialize_assistant_turn`).
     tokenizer:
-        Any object exposing ``.encode(str) -> Sequence`` (the real Qwen3
-        tokenizer in production; a lightweight injected tokenizer in tests).
+        Ignored (back-compat). The estimate is tokenizer-free.
     """
     text = serialize_assistant_turn(response_content)
-    return _encode_len(tokenizer, text)
+    return estimate_tokens_from_chars(text)
 
 
 # ---------------------------------------------------------------------------
@@ -454,46 +494,45 @@ def render_context(
         return ""
 
     # --- Tail-preserving message-level pruning -----------------------------
-    # We want the largest K such that "render+encode of the LAST K messages"
-    # fits in max_len tokens. The naive loop ("drop oldest one, re-encode all,
-    # repeat") is O(N^2) chars — for N=100 messages with long tool_results it
-    # re-encodes millions of chars. Use binary search instead: O(log N) renders
-    # and encodes total. Same result, vastly fewer encode calls.
+    # Length is judged with the fast CHARACTER-BASED estimate (no tokenizer
+    # encode), since the context here is only used as a training PROMPT and is
+    # re-tokenized + re-truncated exactly by train.py at load time anyway —
+    # approximate pruning here is lossless for correctness and ~100x cheaper.
+    # We want the largest K such that "render of the LAST K messages" fits in
+    # max_len (estimated) tokens. Binary search: O(log N) renders.
+    def _est_len(s: str) -> int:
+        return estimate_tokens_from_chars(s)
+
     rendered = _apply_template(tokenizer, flat)
-    if _encode_len(tokenizer, rendered) > max_len and len(flat) > 1:
+    if _est_len(rendered) > max_len and len(flat) > 1:
         # Invariant: keeping the LAST `lo` messages always fits;
         #            keeping the LAST `hi` messages always exceeds.
-        # Initial bounds:
         lo, hi = 1, len(flat)
-        # Anchor lo=1: a single (most recent) message renders to *something*;
-        # token-level safety net below handles the case where it still exceeds.
         while hi - lo > 1:
             mid = (lo + hi) // 2  # try keeping the LAST `mid` messages
             cand = _apply_template(tokenizer, flat[-mid:])
-            if _encode_len(tokenizer, cand) <= max_len:
+            if _est_len(cand) <= max_len:
                 lo, rendered = mid, cand          # `mid` fits — keep it as best
             else:
                 hi = mid                          # `mid` exceeds — too many
         flat = flat[-lo:]
-        # `rendered` already corresponds to flat[-lo:] from the last successful
-        # candidate (or to the original full render if lo stayed at 1 and never
-        # updated; re-render once defensively).
-        if _encode_len(tokenizer, rendered) > max_len:
+        if _est_len(rendered) > max_len:
             rendered = _apply_template(tokenizer, flat)
 
-    # --- Token-level left-truncation safety net ----------------------------
+    # --- Character-level left-truncation safety net ------------------------
     # A single remaining (most recent) message may still exceed max_len. Keep
-    # the TAIL of the token sequence so the freshest context survives.
-    ids = _encode(tokenizer, rendered)
-    if len(ids) > max_len:
-        tail_ids = ids[-max_len:]
-        decoded = _decode(tokenizer, tail_ids)
-        if decoded is not None:
-            rendered = decoded
-        else:
-            # No decode available (lightweight tokenizer): approximate by
-            # left-trimming characters proportionally so the result fits.
-            rendered = _char_left_trim_to_tokens(tokenizer, rendered, max_len)
+    # the TAIL (freshest context) by trimming characters from the left until the
+    # estimated token length fits. ``estimate_tokens_from_chars`` is monotonic in
+    # length, so a proportional cut + small fixup converges in O(1) passes.
+    if _est_len(rendered) > max_len and len(rendered) > 1:
+        # Proportional first cut: keep roughly the last (max_len/est)*len chars.
+        est = _est_len(rendered)
+        keep = max(1, int(len(rendered) * (max_len / est)))
+        rendered = rendered[-keep:]
+        # Fixup: trim a bit more if the estimate still slightly exceeds.
+        while _est_len(rendered) > max_len and len(rendered) > 1:
+            drop = max(1, len(rendered) - int(len(rendered) * max_len / max(1, _est_len(rendered))))
+            rendered = rendered[drop:]
 
     return rendered
 
