@@ -65,6 +65,13 @@ if _SRC_DIR not in sys.path:
 
 import labeling  # noqa: E402
 
+# Optional tqdm progress bar. If tqdm isn't installed we fall back to the
+# existing periodic print lines, so this is never a hard dependency.
+try:
+    from tqdm import tqdm as _tqdm  # type: ignore
+except Exception:  # pragma: no cover - tqdm optional
+    _tqdm = None
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 DEFAULT_INPUT = os.path.join(_REPO_ROOT, "demo_data.jsonl")
 if not os.path.exists(DEFAULT_INPUT):
@@ -178,13 +185,47 @@ def _raw_ctx_key(context_messages: List[dict]) -> str:
 
     ``render_context`` is a pure function of (context_messages, max_len,
     max_block_chars), so identical raw contexts always render to identical
-    prompts. Hashing the raw context lets us dedup BEFORE rendering (so we never
-    pay the expensive render for samples that will be dropped) and acts as the
-    per-record render cache key.
+    prompts. Hashing the raw context lets us dedup BEFORE rendering and acts as
+    the per-record render cache key.
+
+    Standalone form (used outside the per-record explode loop). Inside
+    ``explode_record_light`` we use the INCREMENTAL hasher below to avoid an
+    O(turns^2) blow-up on very long conversations.
     """
     return hashlib.sha1(
         json.dumps(context_messages, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+class _PrefixHasher:
+    """Incremental hash of a growing message PREFIX in O(1) per step.
+
+    In ``explode_record_light`` the contexts are nested prefixes of the same
+    message list: ``[]``, ``messages[:1]``, ``messages[:2]``, ... Re-serializing
+    the whole prefix every step is O(n) per step = O(n^2) total, which makes a
+    single 500-turn conversation take minutes (the "stuck at record N" symptom).
+
+    Instead we fold each newly-exposed message into a running SHA-1 ONCE. Because
+    each prefix differs from the previous by exactly the messages appended, the
+    running digest after k folds uniquely identifies ``messages[:k]`` — a valid
+    stable dedup/cache key. Cost: O(size of each message), summed = O(total
+    chars) for the whole record, not O(n^2).
+    """
+
+    def __init__(self) -> None:
+        self._h = hashlib.sha1()
+        self._n = 0
+
+    def advance_to(self, messages: List[dict], upto: int) -> str:
+        """Fold messages[self._n : upto] and return the key for messages[:upto]."""
+        while self._n < upto:
+            chunk = json.dumps(messages[self._n], ensure_ascii=False, sort_keys=True)
+            # length-prefix each message so concatenation is unambiguous
+            self._h.update(str(len(chunk)).encode("ascii"))
+            self._h.update(b":")
+            self._h.update(chunk.encode("utf-8"))
+            self._n += 1
+        return f"{self._n}:{self._h.hexdigest()}"
 
 
 def explode_record_light(
@@ -215,33 +256,44 @@ def explode_record_light(
     session_id = record.get("session_id", "")
     samples: List[dict] = []
 
-    def _emit(context_messages, turn_content, usage_tokens):
+    # Incremental prefix hasher: O(1)-amortized key per turn instead of
+    # re-serializing the whole prefix each time (which is O(turns^2) and is the
+    # "stuck at record N" symptom on very long conversations). We also store
+    # ``_ctx_upto`` (an index) instead of a COPIED slice ``messages[:i]`` so we
+    # don't allocate N growing slices per record — render uses messages[:upto].
+    hasher = _PrefixHasher()
+
+    def _emit(upto, turn_content, usage_tokens):
         w = 1 if labeling.is_write_response(turn_content, dual_use_as_write=dual_use_as_write) else 0
         t = labeling.count_output_tokens(turn_content, tokenizer)  # char-estimate
+        ctx_hash = hasher.advance_to(messages, upto)  # folds messages[prev:upto]
         samples.append({
             "w": w,
             "t": t,
             "conversation_id": conversation_id,
             "session_id": session_id,
             "usage_output_tokens": usage_tokens,
-            "_ctx": context_messages,           # raw context (for deferred render)
-            "_ctx_hash": _raw_ctx_key(context_messages),  # render-free dedup key
+            "_ctx_msgs": messages,   # shared ref; slice lazily at render time
+            "_ctx_upto": upto,       # context = messages[:upto]
+            "_ctx_hash": ctx_hash,   # render-free, incremental dedup key
         })
 
     # 1) Every assistant turn in the history; context = strictly-prior messages.
+    #    Emitted in increasing ``upto`` so the incremental hasher only ever moves
+    #    forward (each message folded exactly once).
     for i, msg in enumerate(messages):
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
-        _emit(messages[:i], msg.get("content"), None)
+        _emit(i, msg.get("content"), None)
 
-    # 2) Top-level response as the final turn; usage carried as reference column.
+    # 2) Top-level response as the final turn; context = the full history.
     response = record.get("response") or {}
     resp_content = response.get("content")
     usage = response.get("usage") or {}
     usage_tokens = usage.get("output_tokens")
     if not isinstance(usage_tokens, int):
         usage_tokens = None
-    _emit(list(messages), resp_content, usage_tokens)
+    _emit(len(messages), resp_content, usage_tokens)
 
     return samples
 
@@ -255,13 +307,15 @@ def realize_prompt(
 ) -> dict:
     """Turn a kept LIGHT sample into a final sample by rendering its prompt.
 
-    Called ONLY for reservoir-kept samples. Renders ``_ctx`` -> ``prompt`` (with
-    an optional per-record cache keyed by ``_ctx_hash``), builds ``completion``,
-    and drops the internal ``_ctx`` (the bulky raw context) so the in-memory
-    reservoir stays small. The dedup key ``_ctx_hash`` is preserved for the
+    Called ONLY for reservoir-kept samples. Renders the context
+    (``_ctx_msgs[:_ctx_upto]``) -> ``prompt`` (with an optional cache keyed by
+    ``_ctx_hash``), builds ``completion``, and drops the internal context refs so
+    the in-memory reservoir stays small. ``_ctx_hash`` is preserved for the
     reservoir's own dedup bookkeeping (stripped at write time).
     """
-    ctx = sample.pop("_ctx", [])
+    msgs = sample.pop("_ctx_msgs", [])
+    upto = sample.pop("_ctx_upto", 0)
+    ctx = msgs[:upto]
     key = sample.get("_ctx_hash")
     prompt = None
     if render_cache is not None and key is not None:
@@ -414,6 +468,12 @@ def prepare(args: argparse.Namespace) -> Dict[str, Any]:
     log_every = max(1, args.log_every)
     stop_reason = "input exhausted"
 
+    # Progress: a live tqdm bar when available (total=--max-records if set,
+    # else unbounded — tqdm still shows count + rec/s). Falls back to the
+    # periodic print lines when tqdm isn't installed or --no-progress is set.
+    use_bar = (_tqdm is not None) and (not args.no_progress)
+    bar = _tqdm(total=max_records, unit="rec", desc="prepare", dynamic_ncols=True) if use_bar else None
+
     for record in iter_records(args.input):
         n_records += 1
         conv_id = labeling.derive_conversation_id(record)
@@ -431,10 +491,15 @@ def prepare(args: argparse.Namespace) -> Dict[str, Any]:
         for s in samples:
             res.offer(s)
             n_samples_seen += 1
-        if n_records % log_every == 0:
+
+        kept = sum(sum(r.bucket_counts().values()) for r in reservoirs.values())
+        if bar is not None:
+            bar.update(1)
+            if n_records % max(1, log_every // 10) == 0:
+                bar.set_postfix(seen=n_samples_seen, kept=kept, refresh=False)
+        elif n_records % log_every == 0:
             el = time.time() - t0
             rate = n_records / el if el > 0 else 0.0
-            kept = sum(sum(r.bucket_counts().values()) for r in reservoirs.values())
             print(f"[prepare_streaming]   {n_records} records | {n_samples_seen} samples seen "
                   f"| {kept} kept | {rate:.0f} rec/s | elapsed {el:.0f}s")
 
@@ -453,6 +518,8 @@ def prepare(args: argparse.Namespace) -> Dict[str, Any]:
                                f"+{grace} grace records mixed in")
                 break
 
+    if bar is not None:
+        bar.close()
     print(f"[prepare_streaming] scan stopped: {stop_reason} "
           f"({n_records} records, {n_samples_seen} samples seen)")
 
@@ -571,6 +638,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-records", type=int, default=None,
                    help="hard cap: stop after scanning this many records regardless of "
                         "fill state (a simple 'just scan N records' knob).")
+    p.add_argument("--no-progress", dest="no_progress", action="store_true", default=False,
+                   help="disable the tqdm progress bar (use the periodic print lines "
+                        "instead; useful for non-tty logs).")
     return p
 
 
